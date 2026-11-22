@@ -25,6 +25,7 @@ static int g_cpu_n_threads = 4;
 #include "core/crispasr_env.h"
 #include "core/parallel_for.h"
 #include "core/voxcpm2_cpu_conv.h"
+#include "core/tts_ref_cache.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -3907,7 +3908,7 @@ static ggml_tensor* snake1d_ggml(ggml_context* ctx0, ggml_tensor* x, ggml_tensor
     ggml_tensor* inv2 = ggml_reshape_2d(ctx0, inv_alpha, 1, C);
     ggml_tensor* ax = ggml_mul(ctx0, x, a2);
     ggml_tensor* s = ggml_sin(ctx0, ax);
-    ggml_tensor* s2 = ggml_mul(ctx0, s, s);
+    ggml_tensor* s2 = ggml_sqr(ctx0, s);
     ggml_tensor* term = ggml_mul(ctx0, s2, inv2);
     return ggml_add(ctx0, x, term);
 }
@@ -5693,6 +5694,7 @@ static std::vector<float> vae_encode_graph(voxcpm2_context* ctx, const float* pc
     }
     const auto& Tens = ctx->tensors;
     const auto& hp = ctx->hp;
+    const bool enc_dw_shift = vae_dw_shift_for(ctx->backend);      // the decoder's Vulkan depthwise path, for the encoder too
 
     if (vae_tensor_f32(Tens, "vae.enc.conv0.weight_g") == nullptr) {
         return vae_encode_uncached(ctx, pcm, n_samples, out_T_patches);
@@ -5772,7 +5774,8 @@ static std::vector<float> vae_encode_graph(voxcpm2_context* ctx, const float* pc
             ggml_tensor* residual = cur;
             if (Alpha(rp + ".0") && InvAlpha(rp + ".0"))
                 cur = snake1d_ggml(ctx0, cur, Alpha(rp + ".0"), InvAlpha(rp + ".0"));
-            cur = causal_conv1d_ggml(ctx0, cur, Wget(rp + ".1"), Bias(rp + ".1"), dilations[r], /*depthwise*/ true);
+            cur = causal_conv1d_ggml(ctx0, cur, Wget(rp + ".1"), Bias(rp + ".1"), dilations[r], /*depthwise*/ true,
+                                     enc_dw_shift);
             if (Alpha(rp + ".2") && InvAlpha(rp + ".2"))
                 cur = snake1d_ggml(ctx0, cur, Alpha(rp + ".2"), InvAlpha(rp + ".2"));
             cur = causal_conv1d_ggml(ctx0, cur, Wget(rp + ".3"), Bias(rp + ".3"), /*dilation*/ 1, /*depthwise*/ false);
@@ -5879,9 +5882,27 @@ static std::vector<float> vae_encode_dispatch(voxcpm2_context* ctx, const float*
         return use_graph ? g : c;
     }
 
-    if (use_graph)
-        return vae_encode_graph(ctx, pcm, n_samples, out_T_patches);
-    return vae_encode_uncached(ctx, pcm, n_samples, out_T_patches);
+    // The reference's latents depend only on its PCM and the model, and a server re-encodes the same voice on
+    // every request and every sentence: keep them in the shared content-addressed reference cache
+    // (CRISPASR_TTS_REF_CACHE=0 turns it off), as the other cloning backends do.
+    const uint64_t key = crispasr_ref_cache::fnv1a(pcm, (size_t)n_samples * sizeof(float)) ^
+                         crispasr_ref_cache::fnv1a(&ctx->hp, sizeof(ctx->hp)) ^ (use_graph ? 0x9e3779b97f4a7c15ULL : 0);
+    std::vector<uint32_t> shape;
+    std::vector<float> lat;
+    if (crispasr_ref_cache::get_floats("voxcpm2-vae", &key, sizeof(key), shape, lat) && shape.size() == 2 &&
+        (size_t)shape[0] * shape[1] == lat.size()) {
+        if (out_T_patches)
+            *out_T_patches = (int)shape[0];
+        return lat;
+    }
+    int T = 0;
+    lat = use_graph ? vae_encode_graph(ctx, pcm, n_samples, &T) : vae_encode_uncached(ctx, pcm, n_samples, &T);
+    if (out_T_patches)
+        *out_T_patches = T;
+    if (T > 0 && !lat.empty() && lat.size() % (size_t)T == 0)
+        crispasr_ref_cache::put_floats("voxcpm2-vae", &key, sizeof(key), {(uint32_t)T, (uint32_t)(lat.size() / T)},
+                                       lat.data(), lat.size());
+    return lat;
 }
 
 // ---------------------------------------------------------------------------
